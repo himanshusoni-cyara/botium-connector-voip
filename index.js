@@ -123,6 +123,20 @@ module.exports = {
         type: 'string',
         required: false,
         advanced: true
+      },
+      {
+        name: 'VOIP_SMART_TURN_VAD_MODEL_PATH',
+        label: 'Smart Turn TEN VAD ONNX path (optional; default bundled assets/models/ten-vad.int8.onnx)',
+        type: 'string',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_SMART_TURN_VAD_THRESHOLD',
+        label: 'Smart Turn TEN VAD speech threshold',
+        type: 'string',
+        required: false,
+        advanced: true
       }
     ]
   },
