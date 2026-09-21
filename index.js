@@ -28,8 +28,9 @@ module.exports = {
       },
       {
         name: 'VOIP_TTS_EFFECTS_PROFILE',
-        label: 'Voice Effect Profile',
+        label: 'Voice Effect Profiles',
         type: 'speechnoiseprofile',
+        multiple: true,
         required: false
       },
       {
@@ -85,6 +86,41 @@ module.exports = {
         name: 'VOIP_WORKER_LOGS_ENABLE',
         label: 'Forward detailed VoIP worker call logs',
         type: 'boolean',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_STT_TURN_HANDLER',
+        label: 'Bot turn flush handler (PSST timer vs Smart Turn)',
+        type: 'string',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_SMART_TURN_MODEL_PATH',
+        label: 'Smart Turn ONNX path (optional; default auto-download pipecat cpu)',
+        type: 'string',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_SMART_TURN_THRESHOLD',
+        label: 'Smart Turn completion threshold',
+        type: 'string',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_SMART_TURN_MAX_SILENCE_MS',
+        label: 'Smart Turn max silence cap (ms)',
+        type: 'string',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_SMART_TURN_VAD_MIN_SILENCE_MS',
+        label: 'Smart Turn VAD min silence (ms)',
+        type: 'string',
         required: false,
         advanced: true
       }

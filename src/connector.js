@@ -6,6 +6,8 @@ const https = require('https')
 const debug = require('debug')('botium-connector-voip')
 const mm = require('music-metadata')
 const { formatConnectorInfoLine, formatWorkerLogLine, parseBoolean } = require('./worker-logging')
+const { createTurnHandler } = require('./turn-handlers/create-turn-handler')
+const { resolveSmartTurnModelPath } = require('./turn-handlers/smart-turn-model')
 
 // Logging policy: info = rare, business-relevant lifecycle events (always visible).
 // debug = high-frequency diagnostics (DEBUG=botium-connector-voip). warn = degraded but continuing.
@@ -118,7 +120,14 @@ const Capabilities = {
   VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE: 'VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE',
   VOIP_TURN_AUDIO_ENABLE: 'VOIP_TURN_AUDIO_ENABLE',
   VOIP_TURN_AUDIO_PADDING_MS: 'VOIP_TURN_AUDIO_PADDING_MS',
-  VOIP_TURN_AUDIO_OFFSET_MS: 'VOIP_TURN_AUDIO_OFFSET_MS'
+  VOIP_TURN_AUDIO_OFFSET_MS: 'VOIP_TURN_AUDIO_OFFSET_MS',
+  VOIP_STT_TURN_HANDLER: 'VOIP_STT_TURN_HANDLER',
+  VOIP_SMART_TURN_THRESHOLD: 'VOIP_SMART_TURN_THRESHOLD',
+  VOIP_SMART_TURN_MODEL_PATH: 'VOIP_SMART_TURN_MODEL_PATH',
+  VOIP_SMART_TURN_MAX_SILENCE_MS: 'VOIP_SMART_TURN_MAX_SILENCE_MS',
+  VOIP_SMART_TURN_VAD_MIN_SILENCE_MS: 'VOIP_SMART_TURN_VAD_MIN_SILENCE_MS',
+  VOIP_SMART_TURN_INFERENCE_TIMEOUT_MS: 'VOIP_SMART_TURN_INFERENCE_TIMEOUT_MS',
+  VOIP_SMART_TURN_MIN_COMMIT_DELAY_MS: 'VOIP_SMART_TURN_MIN_COMMIT_DELAY_MS'
 }
 
 const Defaults = {
@@ -158,7 +167,13 @@ const Defaults = {
   VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE: false,
   VOIP_TURN_AUDIO_ENABLE: true,
   VOIP_TURN_AUDIO_PADDING_MS: 150,
-  VOIP_TURN_AUDIO_OFFSET_MS: 0
+  VOIP_TURN_AUDIO_OFFSET_MS: 0,
+  VOIP_STT_TURN_HANDLER: 'PSST',
+  VOIP_SMART_TURN_THRESHOLD: 0.5,
+  VOIP_SMART_TURN_MAX_SILENCE_MS: 2000,
+  VOIP_SMART_TURN_VAD_MIN_SILENCE_MS: 280,
+  VOIP_SMART_TURN_INFERENCE_TIMEOUT_MS: 1000,
+  VOIP_SMART_TURN_MIN_COMMIT_DELAY_MS: 300
 }
 
 // Inject the Azure end-of-speech segmentation timeout into the STT body. botium-speech-processing
@@ -220,6 +235,16 @@ class BotiumConnectorVoip {
     debug('Validate called')
     this.caps = Object.assign({}, Defaults, this.caps)
     debug(this.caps.VOIP_STT_MESSAGE_HANDLING)
+
+    const turnHandlerMode = String(this.caps[Capabilities.VOIP_STT_TURN_HANDLER] || 'PSST').toUpperCase()
+    if (turnHandlerMode === 'SMART_TURN') {
+      const modelPath = await resolveSmartTurnModelPath({
+        caps: this.caps,
+        Capabilities,
+        log: (event, data) => _info(event, { sessionId: this.sessionId || null, ...data })
+      })
+      this.caps[Capabilities.VOIP_SMART_TURN_MODEL_PATH] = modelPath
+    }
 
     if (this.caps.VOIP_TTS_URL) {
       this.axiosTtsParams = {
@@ -395,86 +420,42 @@ class BotiumConnectorVoip {
       return (overlap / partialWords.length) < 0.7
     }
 
-    // Arm (or re-arm) the JOIN/PSST silence timer that flushes buffered STT
-    // chunks once the bot has been silent for `joinTimeoutMs`. No-op outside
-    // JOIN/PSST/CONCAT modes (other modes emit finals immediately).
-    const armJoinSilenceTimer = () => {
-      if (!this.botMsgs || this.botMsgs.length === 0) return
-      const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
-      const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || this._hasJoinLogicHookOrRule(this.convoStep)
-      if (!isJoinMethod) return
-      const joinTimeoutMs = this._getEffectiveJoinTimeoutMs(this.convoStep, this.botMsgs)
-      // Variant-3 latency grace: when the last buffered final was cut mid-utterance (no
-      // Azure-detected end-of-speech silence) a continuation is plausible but its STT delivery
-      // lags behind the audio by ~1s. Extend the wall-clock flush window by the grace so the
-      // resumed segment's partial/final (or a worker speechResumed event) can re-arm this timer
-      // and be joined, instead of flushing the first fragment on its own. A natural-ended final
-      // keeps the base window and flushes fast.
-      const graceMs = this._getPsstLatencyGraceMs()
-      const graceApplied = graceMs > 0 && _.isFinite(joinTimeoutMs) && joinTimeoutMs > 0 && !this._isLastFinalNaturalEnd()
-      const effectiveWindowMs = graceApplied ? (joinTimeoutMs + graceMs) : (joinTimeoutMs || 0)
-      if (this.silenceTimeout) {
-        clearTimeout(this.silenceTimeout)
-        this.silenceTimeout = null
-      }
-      const bufferedAtArm = this.botMsgs.length
-      const armedAt = Date.now()
-      this._markReplyTrace({ psstTimerArmedAtMs: armedAt, psstScheduledMs: effectiveWindowMs || 0 })
-      _info('psst_timer_armed', {
-        sessionId: this.sessionId,
-        joinTimeoutMs: effectiveWindowMs || 0,
-        baseTimeoutMs: joinTimeoutMs || 0,
-        graceMs: graceApplied ? graceMs : 0,
-        graceApplied,
-        bufferedChunks: bufferedAtArm,
-        stopCalled: !!this.stopCalled
-      })
-      // Emit the authoritative flush window so downstream consumers (e.g.
-      // SpeculationBuffer) can size their quiet threshold relative to it.
-      if (this.eventEmitter && _.isFinite(effectiveWindowMs) && effectiveWindowMs > 0) {
-        try {
-          this.eventEmitter.emit('voip.psstTimerArmed', {
-            sessionId: this.sessionId,
-            joinTimeoutMs: effectiveWindowMs,
-            bufferedChunks: bufferedAtArm,
-            armedAt
-          })
-        } catch (emitErr) {
-          // Never block the silence timer on listener errors.
-          debug(`voip.psstTimerArmed emission failed: ${emitErr && emitErr.message}`)
-        }
-      }
-      this.silenceTimeout = setTimeout(() => {
-        const fireDelay = Date.now() - armedAt
-        this._markReplyTrace({ psstTimerFiredAtMs: Date.now(), psstFireDelayMs: fireDelay })
-        if (this.botMsgs.length > 0) {
-          _info('psst_timer_fired', {
-            sessionId: this.sessionId,
-            bufferedChunks: this.botMsgs.length,
-            actualDelayMs: fireDelay,
-            scheduledDelayMs: effectiveWindowMs || 0,
-            graceApplied,
-            outcome: 'emit'
-          })
-          debug('Silence Duration Timeout (JOIN/PSST):', effectiveWindowMs, 'ms')
-          sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
-          this.firstMsg = false
-          this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
-          this.botMsgs = []
-          // Reset partial-driven extension budget for next cycle.
-          this.psstRearmCount = 0
-          this.psstFirstRearmAt = null
-        } else {
-          _info('psst_timer_fired', {
-            sessionId: this.sessionId,
-            bufferedChunks: 0,
-            actualDelayMs: fireDelay,
-            scheduledDelayMs: effectiveWindowMs || 0,
-            outcome: 'noop_empty_buffer'
-          })
-        }
-      }, effectiveWindowMs || 0)
+    const connector = this
+    const flushBufferedBotMsgs = () => {
+      if (!connector.botMsgs || connector.botMsgs.length === 0) return
+      sendBotMsg(joinBotMsg(connector.botMsgs, connector.joinLastPrevMsg))
+      connector.firstMsg = false
+      connector.joinLastPrevMsg = connector.botMsgs[connector.botMsgs.length - 1]
+      connector.botMsgs = []
+      connector.psstRearmCount = 0
+      connector.psstFirstRearmAt = null
     }
+
+    const turnHandlerCtx = {
+      get botMsgs () { return connector.botMsgs },
+      get sessionId () { return connector.sessionId },
+      get caps () { return connector.caps },
+      get convoStep () { return connector.convoStep },
+      get eventEmitter () { return connector.eventEmitter },
+      get audioStream () { return connector.audioStream },
+      get stopCalled () { return connector.stopCalled },
+      Capabilities,
+      _info,
+      debug,
+      markReplyTrace: (patch) => connector._markReplyTrace(patch),
+      getEffectiveJoinTimeoutMs: (step, msgs) => connector._getEffectiveJoinTimeoutMs(step, msgs),
+      getPsstLatencyGraceMs: () => connector._getPsstLatencyGraceMs(),
+      isLastFinalNaturalEnd: () => connector._isLastFinalNaturalEnd(),
+      isJoinMethod: () => {
+        const sttHandling = connector.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
+        return sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' ||
+          connector._hasJoinLogicHookOrRule(connector.convoStep)
+      },
+      flushBufferedBotMsgs
+    }
+
+    connector.turnHandler = createTurnHandler(connector.caps, Capabilities, turnHandlerCtx)
+    const armJoinSilenceTimer = () => connector.turnHandler.onFinalBuffered()
 
     // Flush buffered STT chunks on teardown so a late final is not lost when
     // the PSST silence timer is cleared by Stop(). Falls back to the cached
@@ -482,14 +463,9 @@ class BotiumConnectorVoip {
     // final for the closing utterance. Must be called from every terminal
     // path before `this.end` is flipped.
     const flushPendingBotMsgs = (reason) => {
-      if (this.silenceTimeout) {
-        _info('psst_timer_cleared', {
-          sessionId: this.sessionId,
-          reason: `flush:${reason}`,
-          bufferedChunks: (this.botMsgs && this.botMsgs.length) || 0
-        })
-        clearTimeout(this.silenceTimeout)
-        this.silenceTimeout = null
+      if (connector.turnHandler) {
+        connector.turnHandler.clearTimer(`flush:${reason}`)
+        connector.turnHandler.reset()
       }
       if (this.botMsgs && this.botMsgs.length > 0) {
         const chunkCount = this.botMsgs.length
@@ -697,7 +673,7 @@ class BotiumConnectorVoip {
         this.lastPartialBotMsg = null
         this.firstMsg = true
         this.firstSttInfoReceived = false
-        this.silenceTimeout = null
+        if (connector.turnHandler) connector.turnHandler.reset()
         // PSST re-arm tracking: new-utterance partials reset the silence timer,
         // bounded by MAX_EXTENSION_MS to prevent infinite stranding.
         this.psstRearmCount = 0
@@ -932,7 +908,8 @@ class BotiumConnectorVoip {
             this.sessionId = parsedData.voipConfig.sessionId
             _info('callinfo_initialized', {
               sessionId: this.sessionId,
-              sttHandling: this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
+              sttHandling: this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING],
+              turnHandler: String(this.caps[Capabilities.VOIP_STT_TURN_HANDLER] || 'PSST').toUpperCase()
             })
             if (parseBoolean(this.caps[Capabilities.VOIP_WORKER_LOGS_ENABLE]) && parsedData.voipConfig.workerLogsEnabled !== true) {
               _info('worker_logs_unsupported', {
@@ -1061,6 +1038,9 @@ class BotiumConnectorVoip {
                 const buf = Buffer.from(parsedData.chunk, 'base64')
                 this.audioStream.pcmParts.push(buf)
                 this.audioStream.totalBytes += buf.length
+                if (connector.turnHandler && connector.turnHandler.onAudioChunk) {
+                  connector.turnHandler.onAudioChunk(buf, this.audioStream.format)
+                }
                 this._maybeDetectAgentAudibleOnRecording(this._activeUserSaysVoipAgent)
                 // Emit any per-turn audio whose playback the recording has now caught up to,
                 // so the live transcript can show it mid-run (no UserSays latency).
@@ -1177,7 +1157,7 @@ class BotiumConnectorVoip {
                   reason: 'speech_resumed',
                   silenceDurationMs: _.get(parsedData, 'data.silenceDurationMs', null)
                 })
-                armJoinSilenceTimer()
+                connector.turnHandler.onSpeechResumed(withinCap)
               }
             }
           }
@@ -1211,7 +1191,7 @@ class BotiumConnectorVoip {
               partialIndex: this.sttPartialCount,
               preview: partialPreview,
               bufferedChunks: (this.botMsgs && this.botMsgs.length) || 0,
-              timerActive: !!this.silenceTimeout
+              timerActive: !!(connector.turnHandler && connector.turnHandler.silenceTimerActive)
             })
             // Emit liveness keep-alive so waiters can distinguish "bot silent"
             // from "bot streaming partials between finals".
@@ -1227,10 +1207,10 @@ class BotiumConnectorVoip {
             //   Empty buffer → clear timer (final will arm fresh).
             //   Buffered finals + new-utterance partial → re-arm within cap.
             //   Tail/echo or cap-exceeded partials → ignore (legacy path).
-            if (this.silenceTimeout) {
+            if (connector.turnHandler && connector.turnHandler.silenceTimerActive) {
               if (!this.botMsgs || this.botMsgs.length === 0) {
-                clearTimeout(this.silenceTimeout)
-                this.silenceTimeout = null
+                connector.turnHandler.clearTimer('partial_empty_buffer')
+                connector.turnHandler.reset()
               } else {
                 const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
                 const isPsstMode = sttHandling === 'PSST'
@@ -1249,8 +1229,7 @@ class BotiumConnectorVoip {
                       reason: 'new_utterance_partial',
                       partialPreview
                     })
-                    // armJoinSilenceTimer() handles clearing the existing timeout.
-                    armJoinSilenceTimer()
+                    connector.turnHandler.onPartialNewUtterance()
                   }
                 }
               }
@@ -1484,10 +1463,8 @@ class BotiumConnectorVoip {
       setTimeout(async () => {
         try {
           let duration = 0
-          const preferVoiceCapRaw = this.caps[Capabilities.VOIP_USER_INPUT_PREFER_VOICE]
-          const preferVoice = !!preferVoiceCapRaw
-          const skipTtsForMixedInput = preferVoice && hasText && hasVoiceMedia
-          debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} preferVoice=${preferVoice} preferVoiceRaw=${JSON.stringify(preferVoiceCapRaw)} skipTtsForMixedInput=${skipTtsForMixedInput}`)
+          const skipTtsForMixedInput = hasVoiceMedia
+          debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} skipTtsForMixedInput=${skipTtsForMixedInput}`)
 
           // Stamp `msg.voipAgent` at the moment bytes leave the WebSocket so
           // the coach can place the agent turn on the recording timeline.
@@ -1627,7 +1604,7 @@ class BotiumConnectorVoip {
                 }
               }
             } else {
-              debug('UserSays routing: skipping TTS for mixed input because VOIP_USER_INPUT_PREFER_VOICE is enabled')
+              debug('UserSays routing: skipping TTS because provided audio takes precedence')
             }
           }
           if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
@@ -2214,9 +2191,9 @@ class BotiumConnectorVoip {
   async Stop () {
     debug(`${this.sessionId} - Stop called`)
     this.stopCalled = true
-    if (this.silenceTimeout) {
-      clearTimeout(this.silenceTimeout)
-      this.silenceTimeout = null
+    if (this.turnHandler) {
+      this.turnHandler.clearTimer('stop')
+      this.turnHandler.reset()
     }
     if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
       const request = JSON.stringify({
