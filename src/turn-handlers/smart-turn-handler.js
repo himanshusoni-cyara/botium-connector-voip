@@ -1,6 +1,7 @@
 const fs = require('fs')
 const _ = require('lodash')
-const { RmsVad } = require('./rms-vad')
+const { TenVad } = require('./ten-vad')
+const { bundledModelPath, configuredOverridePath: tenVadConfiguredPath } = require('./ten-vad-model')
 const { getTurnAudioFloat32, recordingSecNow } = require('./turn-audio')
 const { defaultCachePath, configuredOverridePath } = require('./smart-turn-model')
 
@@ -63,7 +64,22 @@ class SmartTurnHandler {
     const threshold = parseFloat(caps[Capabilities.VOIP_SMART_TURN_THRESHOLD])
     this._smartTurn = new mod.SmartTurn({ threshold: _.isFinite(threshold) ? threshold : 0.5 })
     const minSilence = parseInt(caps[Capabilities.VOIP_SMART_TURN_VAD_MIN_SILENCE_MS], 10)
-    this._vad = new RmsVad({ minSilenceMs: _.isFinite(minSilence) && minSilence > 0 ? minSilence : 280 })
+    const vadMinSilenceMs = _.isFinite(minSilence) && minSilence > 0 ? minSilence : 280
+    const vadModelPath =
+      caps[Capabilities.VOIP_SMART_TURN_VAD_MODEL_PATH] ||
+      tenVadConfiguredPath(caps, Capabilities) ||
+      (fs.existsSync(bundledModelPath()) ? bundledModelPath() : null)
+    const vadThreshold = parseFloat(caps[Capabilities.VOIP_SMART_TURN_VAD_THRESHOLD])
+    if (!vadModelPath) {
+      this._initError = 'ten_vad_model_missing'
+      _info('smart_turn_fallback_psst', { sessionId, reason: this._initError })
+      return
+    }
+    this._vad = new TenVad({
+      modelPath: vadModelPath,
+      threshold: _.isFinite(vadThreshold) ? vadThreshold : 0.5,
+      minSilenceMs: vadMinSilenceMs
+    })
     this._vad.onPause(() => this._onVadPause())
   }
 
