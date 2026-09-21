@@ -3,8 +3,13 @@ const assert = require('node:assert/strict')
 const { createTurnHandler } = require('../src/turn-handlers/create-turn-handler')
 const { PsstTurnHandler } = require('../src/turn-handlers/psst-turn-handler')
 const { getTurnAudioFloat32, pcm16ToFloat32 } = require('../src/turn-handlers/turn-audio')
-const { RmsVad } = require('../src/turn-handlers/rms-vad')
 const { defaultCachePath, ONNX_FILENAME, HF_MODEL_ID } = require('../src/turn-handlers/smart-turn-model')
+const {
+  bundledModelPath,
+  TEN_VAD_DOWNLOAD_URL,
+  ONNX_FILENAME: TEN_VAD_FILENAME,
+  parseTenVadMetadata
+} = require('../src/turn-handlers/ten-vad-model')
 
 const Capabilities = {
   VOIP_STT_TURN_HANDLER: 'VOIP_STT_TURN_HANDLER',
@@ -72,17 +77,18 @@ test('smart turn default cache uses pipecat cpu onnx for @micdrop/smart-turn', (
   assert.ok(defaultCachePath().endsWith('smart-turn-v3.2-cpu.onnx'))
 })
 
-test('RmsVad fires onPause after sustained silence', () => {
-  let pauses = 0
-  const vad = new RmsVad({ minSilenceMs: 60, frameMs: 30, rmsThreshold: 100 })
-  vad.onPause(() => { pauses += 1 })
-  const sampleRate = 16000
-  const loud = Buffer.alloc(sampleRate * 2)
-  for (let i = 0; i < loud.length; i += 2) loud.writeInt16LE(8000, i)
-  vad.feedPcm16(loud, sampleRate, 1)
-  const quiet = Buffer.alloc(sampleRate * 2)
-  vad.feedPcm16(quiet, sampleRate, 1)
-  vad.feedPcm16(quiet, sampleRate, 1)
-  vad.feedPcm16(quiet, sampleRate, 1)
-  assert.equal(pauses, 1)
+test('ten-vad bundles sherpa int8 onnx with attributed download URL', () => {
+  assert.equal(TEN_VAD_FILENAME, 'ten-vad.int8.onnx')
+  assert.ok(TEN_VAD_DOWNLOAD_URL.includes('sherpa-onnx/releases/download/asr-models/ten-vad.int8.onnx'))
+  const modelPath = bundledModelPath()
+  assert.ok(modelPath.includes('assets/models/ten-vad.int8.onnx'))
+  assert.ok(require('fs').existsSync(modelPath))
+})
+
+test('parseTenVadMetadata reads sherpa-packaged model vectors', () => {
+  const modelPath = bundledModelPath()
+  if (!require('fs').existsSync(modelPath)) return
+  const meta = parseTenVadMetadata(modelPath)
+  assert.equal(meta.mean.length, 41)
+  assert.equal(meta.window.length, 768)
 })
