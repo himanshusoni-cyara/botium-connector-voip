@@ -7,9 +7,22 @@ const debug = require('debug')('botium-connector-voip')
 const mm = require('music-metadata')
 const { formatConnectorInfoLine, formatWorkerLogLine, parseBoolean } = require('./worker-logging')
 const { createTurnHandler } = require('./turn-handlers/create-turn-handler')
-const { resolveSmartTurnModelPath } = require('./turn-handlers/smart-turn-model')
 const { resolveTenVadModelPath } = require('./turn-handlers/ten-vad-model')
-
+const { resolveCedTinyModelPath } = require('./audio-tagging/ced-tiny-model')
+const { InboundLane } = require('./inbound/inbound-lane')
+const { InboundSceneClassifier } = require('./audio-tagging/inbound-scene-classifier')
+const { waitForOutboundAllowed } = require('./inbound/outbound-gate')
+const {
+  speechEndAtMsFromFinal,
+  computeConnectorDeadlineMs,
+  computeReplyConnectorDeadlineAtMs,
+  applyOtsLatencyProfile
+} = require('./reply-budget')
+const {
+  HANDLING_NAMO,
+  isNamoHandling,
+  isBufferedSttHandling
+} = require('./stt-message-handling')
 // Logging policy: info = rare, business-relevant lifecycle events (always visible).
 // debug = high-frequency diagnostics (DEBUG=botium-connector-voip). warn = degraded but continuing.
 // error = abort/failure. No secrets in info; STT text only as length or truncated in info.
@@ -123,14 +136,41 @@ const Capabilities = {
   VOIP_TURN_AUDIO_PADDING_MS: 'VOIP_TURN_AUDIO_PADDING_MS',
   VOIP_TURN_AUDIO_OFFSET_MS: 'VOIP_TURN_AUDIO_OFFSET_MS',
   VOIP_STT_TURN_HANDLER: 'VOIP_STT_TURN_HANDLER',
-  VOIP_SMART_TURN_THRESHOLD: 'VOIP_SMART_TURN_THRESHOLD',
-  VOIP_SMART_TURN_MODEL_PATH: 'VOIP_SMART_TURN_MODEL_PATH',
-  VOIP_SMART_TURN_MAX_SILENCE_MS: 'VOIP_SMART_TURN_MAX_SILENCE_MS',
-  VOIP_SMART_TURN_VAD_MIN_SILENCE_MS: 'VOIP_SMART_TURN_VAD_MIN_SILENCE_MS',
-  VOIP_SMART_TURN_INFERENCE_TIMEOUT_MS: 'VOIP_SMART_TURN_INFERENCE_TIMEOUT_MS',
-  VOIP_SMART_TURN_MIN_COMMIT_DELAY_MS: 'VOIP_SMART_TURN_MIN_COMMIT_DELAY_MS',
-  VOIP_SMART_TURN_VAD_MODEL_PATH: 'VOIP_SMART_TURN_VAD_MODEL_PATH',
-  VOIP_SMART_TURN_VAD_THRESHOLD: 'VOIP_SMART_TURN_VAD_THRESHOLD'
+  VOIP_TEN_VAD_MODEL_PATH: 'VOIP_TEN_VAD_MODEL_PATH',
+  VOIP_TEN_VAD_THRESHOLD: 'VOIP_TEN_VAD_THRESHOLD',
+  VOIP_TEN_VAD_MIN_SILENCE_MS: 'VOIP_TEN_VAD_MIN_SILENCE_MS',
+  VOIP_NAMO_EOU_THRESHOLD: 'VOIP_NAMO_EOU_THRESHOLD',
+  VOIP_NAMO_MIN_WAIT_MS: 'VOIP_NAMO_MIN_WAIT_MS',
+  VOIP_NAMO_MAX_WAIT_MS: 'VOIP_NAMO_MAX_WAIT_MS',
+  VOIP_NAMO_QUESTION_FLUSH_MS: 'VOIP_NAMO_QUESTION_FLUSH_MS',
+  VOIP_NAMO_EMIT_STABLE_MS: 'VOIP_NAMO_EMIT_STABLE_MS',
+  VOIP_NAMO_GAP_OUTLIER_FACTOR: 'VOIP_NAMO_GAP_OUTLIER_FACTOR',
+  VOIP_NAMO_REOPEN_MS: 'VOIP_NAMO_REOPEN_MS',
+  VOIP_NAMO_DTMF_ECHO_MS: 'VOIP_NAMO_DTMF_ECHO_MS',
+  VOIP_NAMO_VAD_SHORT_SEGMENT_MERGE_MS: 'VOIP_NAMO_VAD_SHORT_SEGMENT_MERGE_MS',
+  VOIP_NAMO_VAD_ENABLE: 'VOIP_NAMO_VAD_ENABLE',
+  VOIP_NAMO_VAD_MODEL_PATH: 'VOIP_NAMO_VAD_MODEL_PATH',
+  VOIP_NAMO_MODEL_ID: 'VOIP_NAMO_MODEL_ID',
+  VOIP_NAMO_MODEL_REVISION: 'VOIP_NAMO_MODEL_REVISION',
+  VOIP_NAMO_MODEL_PATH: 'VOIP_NAMO_MODEL_PATH',
+  VOIP_NAMO_CACHE_DIR: 'VOIP_NAMO_CACHE_DIR',
+  VOIP_NAMO_FALLBACK_HANDLING: 'VOIP_NAMO_FALLBACK_HANDLING',
+  VOIP_HALF_DUPLEX_ENABLE: 'VOIP_HALF_DUPLEX_ENABLE',
+  VOIP_OUTBOUND_GATE_QUIET_MS: 'VOIP_OUTBOUND_GATE_QUIET_MS',
+  VOIP_OUTBOUND_GATE_MAX_WAIT_MS: 'VOIP_OUTBOUND_GATE_MAX_WAIT_MS',
+  VOIP_CED_ENABLE: 'VOIP_CED_ENABLE',
+  VOIP_CED_TINY_MODEL_PATH: 'VOIP_CED_TINY_MODEL_PATH',
+  VOIP_CED_SPEECH_PROB_MIN: 'VOIP_CED_SPEECH_PROB_MIN',
+  VOIP_CED_MUSIC_PROB_MIN: 'VOIP_CED_MUSIC_PROB_MIN',
+  VOIP_IVR_DEFER_DELIVERY_ENABLE: 'VOIP_IVR_DEFER_DELIVERY_ENABLE',
+  VOIP_IVR_DELIVERY_QUIET_MS: 'VOIP_IVR_DELIVERY_QUIET_MS',
+  VOIP_IVR_JOIN_TIMEOUT_MS: 'VOIP_IVR_JOIN_TIMEOUT_MS',
+  VOIP_IVR_MAX_JOIN_CHUNKS: 'VOIP_IVR_MAX_JOIN_CHUNKS',
+  VOIP_IVR_DELIVERY_MAX_WAIT_MS: 'VOIP_IVR_DELIVERY_MAX_WAIT_MS',
+  VOIP_REPLY_BUDGET_MS: 'VOIP_REPLY_BUDGET_MS',
+  VOIP_REPLY_COACH_RESERVE_MS: 'VOIP_REPLY_COACH_RESERVE_MS',
+  VOIP_REPLY_WIRE_RESERVE_MS: 'VOIP_REPLY_WIRE_RESERVE_MS',
+  VOIP_OTS_LATENCY_PROFILE: 'VOIP_OTS_LATENCY_PROFILE'
 }
 
 const Defaults = {
@@ -171,13 +211,35 @@ const Defaults = {
   VOIP_TURN_AUDIO_ENABLE: true,
   VOIP_TURN_AUDIO_PADDING_MS: 150,
   VOIP_TURN_AUDIO_OFFSET_MS: 0,
-  VOIP_STT_TURN_HANDLER: 'PSST',
-  VOIP_SMART_TURN_THRESHOLD: 0.5,
-  VOIP_SMART_TURN_MAX_SILENCE_MS: 2000,
-  VOIP_SMART_TURN_VAD_MIN_SILENCE_MS: 280,
-  VOIP_SMART_TURN_INFERENCE_TIMEOUT_MS: 1000,
-  VOIP_SMART_TURN_MIN_COMMIT_DELAY_MS: 300,
-  VOIP_SMART_TURN_VAD_THRESHOLD: 0.5
+  VOIP_STT_TURN_HANDLER: 'NAMO',
+  VOIP_TEN_VAD_THRESHOLD: 0.5,
+  VOIP_TEN_VAD_MIN_SILENCE_MS: 280,
+  VOIP_NAMO_EOU_THRESHOLD: 0.85,
+  VOIP_NAMO_MIN_WAIT_MS: 250,
+  VOIP_NAMO_MAX_WAIT_MS: 8000,
+  VOIP_NAMO_QUESTION_FLUSH_MS: 2000,
+  VOIP_NAMO_EMIT_STABLE_MS: 600,
+  VOIP_NAMO_GAP_OUTLIER_FACTOR: 2.5,
+  VOIP_NAMO_REOPEN_MS: 800,
+  VOIP_NAMO_DTMF_ECHO_MS: 600,
+  VOIP_NAMO_VAD_SHORT_SEGMENT_MERGE_MS: 250,
+  VOIP_NAMO_VAD_ENABLE: true,
+  VOIP_NAMO_FALLBACK_HANDLING: 'PSST',
+  VOIP_HALF_DUPLEX_ENABLE: true,
+  VOIP_OUTBOUND_GATE_QUIET_MS: 430,
+  VOIP_OUTBOUND_GATE_MAX_WAIT_MS: 5000,
+  VOIP_CED_ENABLE: true,
+  VOIP_CED_SPEECH_PROB_MIN: 0.35,
+  VOIP_CED_MUSIC_PROB_MIN: 0.45,
+  VOIP_IVR_DEFER_DELIVERY_ENABLE: true,
+  VOIP_IVR_DELIVERY_QUIET_MS: 400,
+  VOIP_IVR_JOIN_TIMEOUT_MS: 1500,
+  VOIP_IVR_MAX_JOIN_CHUNKS: 4,
+  VOIP_IVR_DELIVERY_MAX_WAIT_MS: 2500,
+  VOIP_REPLY_BUDGET_MS: 0,
+  VOIP_REPLY_COACH_RESERVE_MS: 2500,
+  VOIP_REPLY_WIRE_RESERVE_MS: 800,
+  VOIP_OTS_LATENCY_PROFILE: false
 }
 
 // Inject the Azure end-of-speech segmentation timeout into the STT body. botium-speech-processing
@@ -237,24 +299,35 @@ class BotiumConnectorVoip {
 
   async Validate () {
     debug('Validate called')
-    this.caps = Object.assign({}, Defaults, this.caps)
+    const userCaps = this.caps || {}
+    this.caps = Object.assign({}, Defaults, userCaps)
+    applyOtsLatencyProfile(this.caps, userCaps, Capabilities, Defaults)
+    const turnHandlerKey = String(this.caps[Capabilities.VOIP_STT_TURN_HANDLER] || 'NAMO').toUpperCase()
+    const handlingKey = String(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] || '').toUpperCase()
+    if (turnHandlerKey === 'NAMO' && handlingKey === 'PSST') {
+      _info('voip_handling_legacy_composite', {
+        sessionId: this.sessionId || null,
+        from: 'PSST',
+        to: HANDLING_NAMO
+      })
+      this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] = HANDLING_NAMO
+    }
     debug(this.caps.VOIP_STT_MESSAGE_HANDLING)
 
-    const turnHandlerMode = String(this.caps[Capabilities.VOIP_STT_TURN_HANDLER] || 'PSST').toUpperCase()
-    if (turnHandlerMode === 'SMART_TURN') {
-      const log = (event, data) => _info(event, { sessionId: this.sessionId || null, ...data })
-      const modelPath = await resolveSmartTurnModelPath({
-        caps: this.caps,
-        Capabilities,
-        log
-      })
-      this.caps[Capabilities.VOIP_SMART_TURN_MODEL_PATH] = modelPath
-      const vadModelPath = await resolveTenVadModelPath({
-        caps: this.caps,
-        Capabilities,
-        log
-      })
-      this.caps[Capabilities.VOIP_SMART_TURN_VAD_MODEL_PATH] = vadModelPath
+    const log = (event, data) => _info(event, { sessionId: this.sessionId || null, ...data })
+    const vadModelPath = await resolveTenVadModelPath({
+      caps: this.caps,
+      Capabilities,
+      log
+    })
+    this.caps[Capabilities.VOIP_TEN_VAD_MODEL_PATH] = vadModelPath
+    const cedPath = await resolveCedTinyModelPath({
+      caps: this.caps,
+      Capabilities,
+      log
+    })
+    if (cedPath) {
+      this.caps[Capabilities.VOIP_CED_TINY_MODEL_PATH] = cedPath
     }
 
     if (this.caps.VOIP_TTS_URL) {
@@ -432,7 +505,10 @@ class BotiumConnectorVoip {
     }
 
     const connector = this
-    const flushBufferedBotMsgs = () => {
+    connector._lastSttFinalAt = null
+    connector._lastSttPartialAt = null
+    connector._turnSpeechEndAtMs = null
+    const flushBufferedBotMsgsImmediate = () => {
       if (!connector.botMsgs || connector.botMsgs.length === 0) return
       sendBotMsg(joinBotMsg(connector.botMsgs, connector.joinLastPrevMsg))
       connector.firstMsg = false
@@ -440,6 +516,58 @@ class BotiumConnectorVoip {
       connector.botMsgs = []
       connector.psstRearmCount = 0
       connector.psstFirstRearmAt = null
+      connector._turnSpeechEndAtMs = null
+    }
+    connector._realFlushBotMsgs = flushBufferedBotMsgsImmediate
+
+    const vadModelPath = connector.caps[Capabilities.VOIP_TEN_VAD_MODEL_PATH]
+    const vadMinSilence = parseInt(connector.caps[Capabilities.VOIP_TEN_VAD_MIN_SILENCE_MS], 10)
+    const vadThreshold = parseFloat(connector.caps[Capabilities.VOIP_TEN_VAD_THRESHOLD])
+    const namoVadOff = connector.caps[Capabilities.VOIP_NAMO_VAD_ENABLE] === false ||
+      connector.caps[Capabilities.VOIP_NAMO_VAD_ENABLE] === 'false'
+    if (vadModelPath && !namoVadOff) {
+      connector.inboundLane = new InboundLane({
+        modelPath: vadModelPath,
+        threshold: _.isFinite(vadThreshold) ? vadThreshold : 0.5,
+        minSilenceMs: _.isFinite(vadMinSilence) && vadMinSilence > 0 ? vadMinSilence : 280,
+        eventEmitter: connector.eventEmitter,
+        sessionId: connector.sessionId,
+        _info,
+        onSpeechStart: () => {
+          if (connector.turnHandler && connector.turnHandler.onInboundVadSpeechStart) {
+            connector.turnHandler.onInboundVadSpeechStart()
+          }
+        },
+        onSpeechEnd: () => {
+          if (connector.turnHandler && connector.turnHandler.onInboundVadSpeechEnd) {
+            connector.turnHandler.onInboundVadSpeechEnd()
+          }
+        }
+      })
+    }
+    const cedEnabled = connector.caps[Capabilities.VOIP_CED_ENABLE] !== false &&
+      connector.caps[Capabilities.VOIP_CED_ENABLE] !== 'false'
+    connector.sceneClassifier = new InboundSceneClassifier({
+      modelPath: connector.caps[Capabilities.VOIP_CED_TINY_MODEL_PATH],
+      enabled: cedEnabled,
+      speechProbMin: parseFloat(connector.caps[Capabilities.VOIP_CED_SPEECH_PROB_MIN]) || 0.35,
+      musicProbMin: parseFloat(connector.caps[Capabilities.VOIP_CED_MUSIC_PROB_MIN]) || 0.45,
+      eventEmitter: connector.eventEmitter,
+      sessionId: connector.sessionId,
+      _info
+    })
+    connector._ivrDelivery = { cancelPending: () => {} }
+    const flushBufferedBotMsgs = () => {}
+
+    const commitNamoFlush = (botMsg) => {
+      if (!connector.botMsgs || connector.botMsgs.length === 0) return
+      sendBotMsg(botMsg)
+      connector.firstMsg = false
+      connector.joinLastPrevMsg = connector.botMsgs[connector.botMsgs.length - 1]
+      connector.botMsgs = []
+      connector.psstRearmCount = 0
+      connector.psstFirstRearmAt = null
+      connector._turnSpeechEndAtMs = null
     }
 
     const turnHandlerCtx = {
@@ -450,6 +578,8 @@ class BotiumConnectorVoip {
       get eventEmitter () { return connector.eventEmitter },
       get audioStream () { return connector.audioStream },
       get stopCalled () { return connector.stopCalled },
+      get inboundLane () { return connector.inboundLane },
+      get sceneClassifier () { return connector.sceneClassifier },
       Capabilities,
       _info,
       debug,
@@ -459,13 +589,30 @@ class BotiumConnectorVoip {
       isLastFinalNaturalEnd: () => connector._isLastFinalNaturalEnd(),
       isJoinMethod: () => {
         const sttHandling = connector.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
-        return sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' ||
+        return isBufferedSttHandling(sttHandling) ||
           connector._hasJoinLogicHookOrRule(connector.convoStep)
       },
-      flushBufferedBotMsgs
+      getSpeechEndAtMs: () => connector._turnSpeechEndAtMs,
+      getReplyConnectorDeadlineAtMs: () => {
+        const speechEndAt = connector._turnSpeechEndAtMs
+        return computeReplyConnectorDeadlineAtMs(speechEndAt, connector.caps, Capabilities)
+      },
+      getConnectorDeadlineMs: () => computeConnectorDeadlineMs(connector.caps, Capabilities),
+      getReplyBudgetMs: () => {
+        const budget = parseInt(connector.caps[Capabilities.VOIP_REPLY_BUDGET_MS], 10)
+        return Number.isFinite(budget) && budget > 0 ? budget : null
+      },
+      flushBufferedBotMsgs,
+      commitNamoFlush,
+      realFlush: flushBufferedBotMsgsImmediate
     }
 
     connector.turnHandler = createTurnHandler(connector.caps, Capabilities, turnHandlerCtx)
+    if (connector.turnHandler && connector.turnHandler.init) {
+      connector._turnHandlerInitPromise = connector.turnHandler.init().catch((err) => {
+        _info('namo_turn_handler_init_error', { sessionId: connector.sessionId, error: err && err.message })
+      })
+    }
     const armJoinSilenceTimer = () => connector.turnHandler.onFinalBuffered()
 
     // Flush buffered STT chunks on teardown so a late final is not lost when
@@ -474,7 +621,9 @@ class BotiumConnectorVoip {
     // final for the closing utterance. Must be called from every terminal
     // path before `this.end` is flipped.
     const flushPendingBotMsgs = (reason) => {
-      if (connector.turnHandler) {
+      if (connector.turnHandler && connector.turnHandler.forceFlush) {
+        connector.turnHandler.forceFlush(`flush:${reason}`)
+      } else if (connector.turnHandler) {
         connector.turnHandler.clearTimer(`flush:${reason}`)
         connector.turnHandler.reset()
       }
@@ -487,10 +636,14 @@ class BotiumConnectorVoip {
           chunks: chunkCount
         })
         debug(`Flushing ${chunkCount} buffered STT chunk(s) on ${reason}`)
-        sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
-        this.firstMsg = false
-        this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
-        this.botMsgs = []
+        if (this._realFlushBotMsgs) {
+          this._realFlushBotMsgs()
+        } else {
+          sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
+          this.firstMsg = false
+          this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
+          this.botMsgs = []
+        }
         this.lastPartialBotMsg = null
         this.psstRearmCount = 0
         this.psstFirstRearmAt = null
@@ -695,7 +848,13 @@ class BotiumConnectorVoip {
         const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
         const isPsst = sttHandling === 'PSST'
         const sttLegacy = true
-        let sttUrl = this.caps[Capabilities.VOIP_STT_URL_STREAM]
+        let sttUrl = this.caps[Capabilities.VOIP_STT_URL_STREAM] || this.caps[Capabilities.VOIP_STT_URL]
+        if (!sttUrl) {
+          throw new Error(
+            'VoIP STT URL is not configured (VOIP_STT_URL_STREAM / VOIP_STT_URL). ' +
+            'Assign a Speech Recognition profile on the chatbot or set Botium Speech Processing on the Box server.'
+          )
+        }
         if (isPsst && _.isString(sttUrl)) {
           const replaced = sttUrl.replace('/api/sttstream/', '/api/stt/')
           if (replaced !== sttUrl) {
@@ -920,7 +1079,7 @@ class BotiumConnectorVoip {
             _info('callinfo_initialized', {
               sessionId: this.sessionId,
               sttHandling: this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING],
-              turnHandler: String(this.caps[Capabilities.VOIP_STT_TURN_HANDLER] || 'PSST').toUpperCase()
+              turnHandler: 'NAMO'
             })
             if (parseBoolean(this.caps[Capabilities.VOIP_WORKER_LOGS_ENABLE]) && parsedData.voipConfig.workerLogsEnabled !== true) {
               _info('worker_logs_unsupported', {
@@ -1049,6 +1208,13 @@ class BotiumConnectorVoip {
                 const buf = Buffer.from(parsedData.chunk, 'base64')
                 this.audioStream.pcmParts.push(buf)
                 this.audioStream.totalBytes += buf.length
+                if (connector.inboundLane) {
+                  connector.inboundLane.feedPcm16(buf, this.audioStream.format.sampleRate, this.audioStream.format.channels || 1)
+                  if (connector.sceneClassifier) {
+                    const window = connector.inboundLane.getCedAudioWindow()
+                    if (window) connector.sceneClassifier.classifyWindow(window).catch(() => {})
+                  }
+                }
                 if (connector.turnHandler && connector.turnHandler.onAudioChunk) {
                   connector.turnHandler.onAudioChunk(buf, this.audioStream.format)
                 }
@@ -1151,24 +1317,36 @@ class BotiumConnectorVoip {
             // fragment open to be joined instead of flushed on its own. Bounded by the same
             // extension budget as partial-driven re-arms to prevent infinite stranding.
             _info('speech_resumed', { sessionId: this.sessionId })
-            const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
-            const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || this._hasJoinLogicHookOrRule(this.convoStep)
-            if (isJoinMethod && this.botMsgs && this.botMsgs.length > 0) {
-              const MAX_EXTENSION_MS = 60000
-              const now = Date.now()
-              const withinCap = this.psstFirstRearmAt == null || (now - this.psstFirstRearmAt) < MAX_EXTENSION_MS
-              if (withinCap) {
-                if (this.psstFirstRearmAt == null) this.psstFirstRearmAt = now
-                this.psstRearmCount++
-                _info('psst_timer_extended', {
+            if (this.eventEmitter) {
+              try {
+                this.eventEmitter.emit('voip.botActivity', {
                   sessionId: this.sessionId,
-                  rearmCount: this.psstRearmCount,
-                  msSinceFirstRearm: now - this.psstFirstRearmAt,
-                  bufferedChunks: this.botMsgs.length,
-                  reason: 'speech_resumed',
-                  silenceDurationMs: _.get(parsedData, 'data.silenceDurationMs', null)
+                  kind: 'speech_resumed'
                 })
-                connector.turnHandler.onSpeechResumed(withinCap)
+              } catch (err) { /* ignore */ }
+            }
+            const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
+            if (isNamoHandling(sttHandling) && this.botMsgs && this.botMsgs.length > 0) {
+              connector.turnHandler.onSpeechResumed(true)
+            } else {
+              const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || this._hasJoinLogicHookOrRule(this.convoStep)
+              if (isJoinMethod && this.botMsgs && this.botMsgs.length > 0) {
+                const MAX_EXTENSION_MS = 60000
+                const now = Date.now()
+                const withinCap = this.psstFirstRearmAt == null || (now - this.psstFirstRearmAt) < MAX_EXTENSION_MS
+                if (withinCap) {
+                  if (this.psstFirstRearmAt == null) this.psstFirstRearmAt = now
+                  this.psstRearmCount++
+                  _info('psst_timer_extended', {
+                    sessionId: this.sessionId,
+                    rearmCount: this.psstRearmCount,
+                    msSinceFirstRearm: now - this.psstFirstRearmAt,
+                    bufferedChunks: this.botMsgs.length,
+                    reason: 'speech_resumed',
+                    silenceDurationMs: _.get(parsedData, 'data.silenceDurationMs', null)
+                  })
+                  connector.turnHandler.onSpeechResumed(withinCap)
+                }
               }
             }
           }
@@ -1196,6 +1374,7 @@ class BotiumConnectorVoip {
                 )
               }
             }
+            this._lastSttPartialAt = Date.now()
             const partialPreview = typeof partialText === 'string' ? partialText.trim() : ''
             _info('stt_partial_received', {
               sessionId: this.sessionId,
@@ -1346,13 +1525,34 @@ class BotiumConnectorVoip {
               }
               this.botMsgs = []
             }
-            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'PSST' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT') {
+            if (isBufferedSttHandling(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING])) {
               const botMsg = {
                 messageText: normalizedMsgText,
                 sourceData: this._decorateSourceDataWithSttDictionaryReplacements(parsedData, replacementResult)
               }
               this.prevData = parsedData
               if (successfulConfidenceScore) {
+                const finalAtMs = Date.now()
+                this._lastSttFinalAt = finalAtMs
+                const speechEndSec = _.get(parsedData, 'data.speechEndSec', null)
+                const recordingAtSttFinalSec = _.isFinite(_.get(parsedData, 'recordingAtSttFinalSec'))
+                  ? parsedData.recordingAtSttFinalSec
+                  : this._recordingSecNow()
+                const speechEndAt = speechEndAtMsFromFinal({
+                  finalAtMs,
+                  recordingAtSttFinalSec,
+                  speechEndSec
+                })
+                if (Number.isFinite(speechEndAt)) {
+                  this._turnSpeechEndAtMs = speechEndAt
+                }
+                if (this._ivrDelivery && this._ivrDelivery.cancelPending) {
+                  this._ivrDelivery.cancelPending()
+                }
+                if (connector.turnHandler && connector.turnHandler.shouldSuppressSttFinal &&
+                  connector.turnHandler.shouldSuppressSttFinal(normalizedMsgText)) {
+                  return
+                }
                 this.botMsgs.push(botMsg)
 
                 if (this.caps[Capabilities.VOIP_EMIT_SPECULATIVE_TEXT] && this.eventEmitter) {
@@ -1426,6 +1626,12 @@ class BotiumConnectorVoip {
     })
   }
 
+  _isHalfDuplexEnabled () {
+    const v = this.caps[Capabilities.VOIP_HALF_DUPLEX_ENABLE]
+    if (v === false || v === 'false' || v === 0 || v === '0') return false
+    return true
+  }
+
   async UserSays (msg) {
     debug('UserSays called')
     const hasText = !!(msg && msg.messageText)
@@ -1448,6 +1654,9 @@ class BotiumConnectorVoip {
       mediaSize: hasVoiceMedia && msg.media[0] && Buffer.isBuffer(msg.media[0].buffer) ? msg.media[0].buffer.length : undefined
     })
     this._captureUserSaysStart(msgPreview)
+    if ((hasDtmf || dtmfMatch) && this.turnHandler && this.turnHandler.noteAgentDtmf) {
+      this.turnHandler.noteAgentDtmf()
+    }
     // Avoid logging large buffers/base64 (can break job logs and overwhelm stdout)
     try {
       const safeLog = {
@@ -1476,6 +1685,37 @@ class BotiumConnectorVoip {
           let duration = 0
           const skipTtsForMixedInput = hasVoiceMedia
           debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} skipTtsForMixedInput=${skipTtsForMixedInput}`)
+
+          const awaitOutboundGate = async () => {
+            if (!this._isHalfDuplexEnabled() || !this.inboundLane) return null
+            const quietMs = parseInt(this.caps[Capabilities.VOIP_OUTBOUND_GATE_QUIET_MS], 10)
+            let maxWaitMs = parseInt(this.caps[Capabilities.VOIP_OUTBOUND_GATE_MAX_WAIT_MS], 10)
+            const replyBudget = parseInt(this.caps[Capabilities.VOIP_REPLY_BUDGET_MS], 10)
+            const wireReserve = parseInt(this.caps[Capabilities.VOIP_REPLY_WIRE_RESERVE_MS], 10)
+            if (Number.isFinite(replyBudget) && replyBudget > 0) {
+              const wireCap = Number.isFinite(wireReserve) && wireReserve > 0 ? wireReserve : 800
+              if (!_.isFinite(maxWaitMs) || maxWaitMs <= 0 || maxWaitMs > wireCap) {
+                maxWaitMs = wireCap
+              }
+            }
+            const gate = await waitForOutboundAllowed({
+              inboundLane: this.inboundLane,
+              sceneClassifier: this.sceneClassifier,
+              quietMs: _.isFinite(quietMs) && quietMs > 0 ? quietMs : 430,
+              maxWaitMs: _.isFinite(maxWaitMs) && maxWaitMs > 0 ? maxWaitMs : 5000,
+              hasRecentSttPartial: () => {
+                const t = this._lastSttPartialAt
+                return _.isFinite(t) && (Date.now() - t) < 600
+              }
+            })
+            _info('outbound_gate', { sessionId: this.sessionId, ...gate })
+            return gate
+          }
+          const willSendWire = hasDtmf || dtmfMatch || hasVoiceMedia ||
+            (hasText && !skipTtsForMixedInput && (this.axiosTtsParams || hasVoiceMedia))
+          if (willSendWire) {
+            await awaitOutboundGate()
+          }
 
           // Stamp `msg.voipAgent` at the moment bytes leave the WebSocket so
           // the coach can place the agent turn on the recording timeline.
@@ -2035,9 +2275,11 @@ class BotiumConnectorVoip {
     if (parsedData && _.isFinite(atMs)) {
       parsedData.sttFinalReceivedAtMs = atMs
     }
+    const replyBudgetMs = parseInt(this.caps[Capabilities.VOIP_REPLY_BUDGET_MS], 10)
     this._replyTrace = {
       sessionId: this.sessionId,
       botMessagePreview: msgPreview || undefined,
+      replyBudgetMs: Number.isFinite(replyBudgetMs) && replyBudgetMs > 0 ? replyBudgetMs : null,
       sttFinalAtMs: atMs,
       sttRecordingStartSec: _.isFinite(_.get(data, 'start')) ? data.start : null,
       sttRecordingEndSec: _.isFinite(_.get(data, 'end')) ? data.end : null,
@@ -2049,6 +2291,9 @@ class BotiumConnectorVoip {
       psstScheduledMs: null,
       psstTimerFiredAtMs: null,
       psstFireDelayMs: null,
+      commitAtMs: null,
+      connectorCommitRecMs: null,
+      sloMet: null,
       userSaysAtMs: null,
       coachWaitMs: null,
       ttsStartAtMs: null,
@@ -2072,6 +2317,12 @@ class BotiumConnectorVoip {
     if (!this._replyTrace) return
     this._replyTrace.queueAtMs = queuedAt
     this._replyTrace.recordingAtQueueSec = this._recordingSecNow()
+    const speechEndSec = this._replyTrace.sttSpeechEndSec
+    if (Number.isFinite(speechEndSec) && Number.isFinite(this._replyTrace.recordingAtQueueSec)) {
+      this._replyTrace.connectorCommitRecMs = Math.round(
+        (this._replyTrace.recordingAtQueueSec - speechEndSec) * 1000
+      )
+    }
   }
 
   _captureUserSaysStart (msgPreview) {
@@ -2158,7 +2409,13 @@ class BotiumConnectorVoip {
       ms_queue_to_userSays: t.coachWaitMs,
       recMs_sttEnd_to_queue: this._replyTraceRecMs(t.sttRecordingEndSec, t.recordingAtQueueSec),
       recMs_sttEnd_to_wire: this._replyTraceRecMs(t.sttRecordingEndSec, t.wireRecordingStartSec),
-      recMs_speechEnd_to_wire: this._replyTraceRecMs(t.sttSpeechEndSec, t.wireRecordingStartSec)
+      recMs_speechEnd_to_wire: this._replyTraceRecMs(t.sttSpeechEndSec, t.wireRecordingStartSec),
+      replyBudgetMs: t.replyBudgetMs,
+      connectorCommitRecMs: t.connectorCommitRecMs,
+      sloMet: (Number.isFinite(t.replyBudgetMs) && t.replyBudgetMs > 0 &&
+        _.isFinite(t.sttSpeechEndSec) && _.isFinite(t.wireRecordingStartSec))
+        ? this._replyTraceRecMs(t.sttSpeechEndSec, t.wireRecordingStartSec) <= t.replyBudgetMs
+        : null
     })
   }
 

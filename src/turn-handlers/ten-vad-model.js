@@ -11,10 +11,11 @@ const TEN_VAD_DOWNLOAD_URL =
 const TEN_VAD_UPSTREAM_REPO = 'https://github.com/TEN-framework/ten-vad'
 const TEN_VAD_SHERPA_REPO = 'https://github.com/k2-fsa/sherpa-onnx'
 const ONNX_FILENAME = 'ten-vad.int8.onnx'
+const { bundledModelPath: packageBundledModelPath } = require('../package-assets')
 
 let downloadPromise = null
 
-const bundledModelPath = () => path.join(__dirname, '../../assets/models', ONNX_FILENAME)
+const bundledModelPath = () => packageBundledModelPath(ONNX_FILENAME)
 
 const defaultCacheDir = () => {
   if (process.env.BOTIUM_TEN_VAD_CACHE_DIR) {
@@ -33,10 +34,17 @@ const defaultModelPath = () => {
 }
 
 const configuredOverridePath = (caps, Capabilities) => {
-  const fromCap =
-    caps && Capabilities && caps[Capabilities.VOIP_SMART_TURN_VAD_MODEL_PATH]
-  if (fromCap && String(fromCap).trim()) return String(fromCap).trim()
+  const keys = Capabilities && [
+    Capabilities.VOIP_TEN_VAD_MODEL_PATH,
+    Capabilities.VOIP_NAMO_VAD_MODEL_PATH,
+    Capabilities.VOIP_SMART_TURN_VAD_MODEL_PATH
+  ].filter(Boolean)
+  for (const key of keys) {
+    const fromCap = caps && caps[key]
+    if (fromCap && String(fromCap).trim()) return String(fromCap).trim()
+  }
   if (process.env.BOTIUM_TEN_VAD_MODEL_PATH) return String(process.env.BOTIUM_TEN_VAD_MODEL_PATH).trim()
+  if (process.env.VOIP_TEN_VAD_MODEL_PATH) return String(process.env.VOIP_TEN_VAD_MODEL_PATH).trim()
   if (process.env.VOIP_SMART_TURN_VAD_MODEL_PATH) return String(process.env.VOIP_SMART_TURN_VAD_MODEL_PATH).trim()
   return null
 }

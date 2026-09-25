@@ -1,9 +1,8 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const { createTurnHandler } = require('../src/turn-handlers/create-turn-handler')
-const { PsstTurnHandler } = require('../src/turn-handlers/psst-turn-handler')
+const { NamoTurnHandler } = require('../src/turn-handlers/namo-turn-handler')
 const { getTurnAudioFloat32, pcm16ToFloat32 } = require('../src/turn-handlers/turn-audio')
-const { defaultCachePath, ONNX_FILENAME, HF_MODEL_ID } = require('../src/turn-handlers/smart-turn-model')
 const {
   bundledModelPath,
   TEN_VAD_DOWNLOAD_URL,
@@ -14,34 +13,32 @@ const {
 const Capabilities = {
   VOIP_STT_TURN_HANDLER: 'VOIP_STT_TURN_HANDLER',
   VOIP_STT_MESSAGE_HANDLING: 'VOIP_STT_MESSAGE_HANDLING',
-  VOIP_SMART_TURN_THRESHOLD: 'VOIP_SMART_TURN_THRESHOLD',
-  VOIP_SMART_TURN_MODEL_PATH: 'VOIP_SMART_TURN_MODEL_PATH',
-  VOIP_SMART_TURN_MAX_SILENCE_MS: 'VOIP_SMART_TURN_MAX_SILENCE_MS',
-  VOIP_SMART_TURN_VAD_MIN_SILENCE_MS: 'VOIP_SMART_TURN_VAD_MIN_SILENCE_MS',
-  VOIP_SMART_TURN_INFERENCE_TIMEOUT_MS: 'VOIP_SMART_TURN_INFERENCE_TIMEOUT_MS',
-  VOIP_SMART_TURN_MIN_COMMIT_DELAY_MS: 'VOIP_SMART_TURN_MIN_COMMIT_DELAY_MS'
+  VOIP_NAMO_EOU_THRESHOLD: 'VOIP_NAMO_EOU_THRESHOLD',
+  VOIP_NAMO_MODEL_ID: 'VOIP_NAMO_MODEL_ID',
+  VOIP_NAMO_MODEL_REVISION: 'VOIP_NAMO_MODEL_REVISION',
+  VOIP_NAMO_MODEL_PATH: 'VOIP_NAMO_MODEL_PATH',
+  VOIP_NAMO_CACHE_DIR: 'VOIP_NAMO_CACHE_DIR',
+  VOIP_NAMO_FALLBACK_HANDLING: 'VOIP_NAMO_FALLBACK_HANDLING',
+  VOIP_NAMO_VAD_ENABLE: 'VOIP_NAMO_VAD_ENABLE',
+  VOIP_STT_MESSAGE_HANDLING_DELIMITER: 'VOIP_STT_MESSAGE_HANDLING_DELIMITER'
 }
 
-test('createTurnHandler defaults to PSST', () => {
-  const flushed = []
+test('createTurnHandler always returns NamoTurnHandler', () => {
   const ctx = {
-    botMsgs: [{ sourceData: { data: { start: 0, end: 1 } } }],
+    botMsgs: [],
     caps: { [Capabilities.VOIP_STT_TURN_HANDLER]: 'PSST' },
-    isJoinMethod: () => true,
-    getEffectiveJoinTimeoutMs: () => 500,
-    getPsstLatencyGraceMs: () => 0,
-    isLastFinalNaturalEnd: () => true,
     sessionId: 's1',
     eventEmitter: null,
     Capabilities,
     _info: () => {},
     debug: () => {},
     markReplyTrace: () => {},
-    stopCalled: false,
-    flushBufferedBotMsgs: () => flushed.push(1)
+    commitNamoFlush: () => {},
+    flushBufferedBotMsgs: () => {},
+    isJoinMethod: () => true
   }
   const handler = createTurnHandler(ctx.caps, Capabilities, ctx)
-  assert.ok(handler instanceof PsstTurnHandler)
+  assert.ok(handler instanceof NamoTurnHandler)
 })
 
 test('pcm16ToFloat32 scales samples', () => {
@@ -69,12 +66,6 @@ test('getTurnAudioFloat32 slices stream by STT bounds', () => {
   assert.ok(audio)
   assert.equal(audio.sampleRate, 8000)
   assert.ok(audio.samples.length > 0)
-})
-
-test('smart turn default cache uses pipecat cpu onnx for @micdrop/smart-turn', () => {
-  assert.equal(ONNX_FILENAME, 'smart-turn-v3.2-cpu.onnx')
-  assert.equal(HF_MODEL_ID, 'pipecat-ai/smart-turn-v3')
-  assert.ok(defaultCachePath().endsWith('smart-turn-v3.2-cpu.onnx'))
 })
 
 test('ten-vad bundles sherpa int8 onnx with attributed download URL', () => {

@@ -90,50 +90,22 @@ module.exports = {
         advanced: true
       },
       {
-        name: 'VOIP_STT_TURN_HANDLER',
-        label: 'Bot turn flush handler (PSST timer vs Smart Turn)',
-        type: 'string',
+        name: 'VOIP_NAMO_EOU_THRESHOLD',
+        label: 'Namo end-of-utterance confidence threshold',
+        type: 'number',
         required: false,
         advanced: true
       },
       {
-        name: 'VOIP_SMART_TURN_MODEL_PATH',
-        label: 'Smart Turn ONNX path (optional; default auto-download pipecat cpu)',
-        type: 'string',
+        name: 'VOIP_NAMO_REOPEN_MS',
+        label: 'Namo soft-end reopen window (ms)',
+        type: 'int',
         required: false,
         advanced: true
       },
       {
-        name: 'VOIP_SMART_TURN_THRESHOLD',
-        label: 'Smart Turn completion threshold',
-        type: 'string',
-        required: false,
-        advanced: true
-      },
-      {
-        name: 'VOIP_SMART_TURN_MAX_SILENCE_MS',
-        label: 'Smart Turn max silence cap (ms)',
-        type: 'string',
-        required: false,
-        advanced: true
-      },
-      {
-        name: 'VOIP_SMART_TURN_VAD_MIN_SILENCE_MS',
-        label: 'Smart Turn VAD min silence (ms)',
-        type: 'string',
-        required: false,
-        advanced: true
-      },
-      {
-        name: 'VOIP_SMART_TURN_VAD_MODEL_PATH',
-        label: 'Smart Turn TEN VAD ONNX path (optional; default bundled assets/models/ten-vad.int8.onnx)',
-        type: 'string',
-        required: false,
-        advanced: true
-      },
-      {
-        name: 'VOIP_SMART_TURN_VAD_THRESHOLD',
-        label: 'Smart Turn TEN VAD speech threshold',
+        name: 'VOIP_TEN_VAD_MODEL_PATH',
+        label: 'TEN VAD ONNX path (default bundled ten-vad.int8.onnx)',
         type: 'string',
         required: false,
         advanced: true
@@ -146,3 +118,6 @@ module.exports = {
     VOIP_CONFIDENCE_THRESHOLD: ConfidenceThresholdLogicHook
   }
 }
+
+module.exports.applyOtsLatencyProfile = require('./src/reply-budget').applyOtsLatencyProfile
+module.exports.CapabilitiesReplyBudget = require('./src/reply-budget')
